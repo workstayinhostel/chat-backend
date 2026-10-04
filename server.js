@@ -18,12 +18,7 @@ const {
   JWT_SECRET,
   ENC_KEY,
   MONGO_URI,
-  MONGO_HOST,
-  MONGO_DATABASE = 'chatapp',
-  MONGO_APP_NAME = 'metufy',
   MONGO_DNS_SERVERS,
-  DB_USER = process.env.dbuser,
-  DB_PASSWORD = process.env.dbpassword,
   GOOGLE_CLIENT_ID,
   PORT = 4000,
   ORIGIN = 'http://192.168.1.83:8000,http://localhost:8000'
@@ -38,14 +33,14 @@ if (!ENC_KEY || !/^[a-f0-9]{64}$/i.test(ENC_KEY)) {
 if (!GOOGLE_CLIENT_ID) {
   throw new Error('Set GOOGLE_CLIENT_ID to your Google OAuth web client ID in server/.env');
 }
-if (!MONGO_URI && (!MONGO_HOST || !DB_USER || !DB_PASSWORD)) {
-  throw new Error('Set MONGO_URI or MONGO_HOST, dbuser, and dbpassword in server/.env');
+if (!MONGO_URI) {
+  throw new Error('Set MONGO_URI to the MongoDB connection string from Atlas in server/.env');
 }
 if (MONGO_DNS_SERVERS) {
   dns.setServers(MONGO_DNS_SERVERS.split(',').map(server => server.trim()).filter(Boolean));
 }
 
-const mongoUri = MONGO_URI || `mongodb+srv://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASSWORD)}@${MONGO_HOST}/${encodeURIComponent(MONGO_DATABASE)}?appName=${encodeURIComponent(MONGO_APP_NAME)}`;
+const mongoUri = MONGO_URI.trim();
 const keyBytes = Buffer.from(ENC_KEY, 'hex');
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 const origins = ORIGIN.split(',').map(value => value.trim()).filter(Boolean);

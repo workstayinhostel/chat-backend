@@ -7,8 +7,8 @@ App sign-in tokens expire after 30 days. Image uploads are stored without resizi
 ## Run locally
 
 1. Install Node.js 20 or newer and make a copy of `.env.example` named `.env`.
-2. Configure your MongoDB Atlas cluster hostname, database username/password, and Google OAuth **Web application** client ID in `.env`. In Atlas, allow the development machine's IP in Network Access.
-   `MONGO_DNS_SERVERS` is optional; set it to comma-separated DNS server IPs only if Node.js cannot resolve Atlas SRV records on your network.
+2. Copy the complete MongoDB connection string from Atlas (**Database → Connect → Drivers**) into `MONGO_URI`, and configure your Google OAuth **Web application** client ID in `.env`. Replace any `<db_username>` / `<db_password>` placeholders with the Atlas database user credentials; percent-encode reserved characters in the username or password. In Atlas, allow the deployment service's outbound IPs (or use the appropriate network access policy) in Network Access.
+   On Render, set `MONGO_URI` in the service's Environment settings to the same complete Atlas connection string. If an SRV URI still fails with `querySrv ETIMEOUT _mongodb._tcp...`, use the non-SRV `mongodb://` connection string supplied by Atlas under its **Standard connection string** option; switching to an SRV URI does not bypass a blocked or failing SRV DNS lookup. `MONGO_DNS_SERVERS` is optional for SRV connections where custom DNS resolvers are required.
 3. Generate fresh secrets in PowerShell:
 
    ```powershell
