@@ -149,7 +149,11 @@ const authRateLimit = rateLimit({
 const connectedClients = new Map();
 const online = connectedClients;
 const rooms = new Map();
+const callSockets = new Map();
+const reconnectTimers = new Map();
+const CALL_RECONNECT_GRACE_MS = 45_000;
 const active = new Set();
+const ownsCallSocket = (room, uid, socket) => callSockets.get(`${room}:${uid}`) === socket;
 const send = (id, data) => {
   online.get(String(id))?.forEach(socket => {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data));
@@ -158,6 +162,15 @@ const send = (id, data) => {
 const endCall = async (room, endReason = 'ended') => {
   const participants = rooms.get(room) || new Set();
   rooms.delete(room);
+  for (const [key, timer] of reconnectTimers) {
+    if (key.startsWith(`${room}:`)) {
+      clearTimeout(timer);
+      reconnectTimers.delete(key);
+    }
+  }
+  for (const key of callSockets.keys()) {
+    if (key.startsWith(`${room}:`)) callSockets.delete(key);
+  }
   const call = await Call.findOneAndUpdate(
     { room, endedAt: { $exists: false } },
     { $set: { endedAt: new Date(), joined: [], endReason } },
@@ -494,6 +507,29 @@ app.get('/api/messages/:id', auth, asyncRoute(async (req, res) => {
   res.json(messages.reverse().map(messageResponse));
 }));
 
+app.get('/api/calls/missed', auth, asyncRoute(async (req, res) => {
+  const calls = await Call.find({
+    members: req.uid,
+    createdBy: { $ne: req.uid },
+    answeredAt: { $exists: false },
+    endedAt: { $exists: true },
+    endReason: { $ne: 'declined' }
+  }).sort({ createdAt: -1 }).limit(100).select('room createdBy video createdAt');
+  const callers = await User.find({ _id: { $in: calls.map(call => call.createdBy) } }).select('_id username displayName');
+  const callerById = new Map(callers.map(caller => [String(caller.id), caller]));
+  res.json(calls.map(call => {
+    const caller = callerById.get(String(call.createdBy));
+    return {
+      id: call.id,
+      room: call.room,
+      username: caller?.username,
+      fromName: caller?.displayName || 'Metufy contact',
+      video: call.video,
+      at: call.createdAt
+    };
+  }));
+}));
+
 app.get('/api/calls/:id', auth, asyncRoute(async (req, res) => {
   let chat;
   let groupId;
@@ -816,7 +852,8 @@ wss.on('connection', async (socket, req) => {
         case 'WEBRTC_SIGNAL': {
           const room = event.room;
           const peerId = requireObjectId(event.to || event.targetUserId, 'recipient id');
-          if (typeof room !== 'string' || !rooms.get(room)?.has(uid) || !rooms.get(room)?.has(peerId)) {
+          if (typeof room !== 'string' || !ownsCallSocket(room, uid, socket) ||
+              !rooms.get(room)?.has(uid) || !rooms.get(room)?.has(peerId)) {
             throw httpError(403, 'Both call participants must have joined');
           }
           if (!await Call.exists({ room, members: { $all: [uid, peerId] }, endedAt: { $exists: false } })) {
@@ -1056,6 +1093,7 @@ wss.on('connection', async (socket, req) => {
             video: Boolean(event.video)
           });
           if (!rooms.has(room)) rooms.set(room, new Set([uid]));
+          callSockets.set(`${room}:${uid}`, socket);
           recipients.forEach(id => send(id, { t: 'call-log', room, chat: callChat, group: groupId }));
           recipients.filter(id => id !== uid).forEach(id => send(id, {
             t: 'call-invite',
@@ -1063,34 +1101,67 @@ wss.on('connection', async (socket, req) => {
             fromName: user.displayName,
             room,
             video: call.video,
-            name: typeof event.name === 'string' ? event.name.slice(0, 80) : undefined
+            name: typeof event.name === 'string' ? event.name.slice(0, 80) : undefined,
+            chatId: String(callChatDoc.id),
+            ...(groupId ? { group: String(groupId) } : {})
           }));
           break;
         }
         case 'call-join': {
           const room = event.room;
           if (typeof room !== 'string' || room.length > 128) throw httpError(400, 'Invalid call room');
+          const wasInRoom = rooms.get(room)?.has(uid) || false;
+          const reconnectKey = `${room}:${uid}`;
+          const priorSocket = callSockets.get(reconnectKey);
+          const priorCall = await Call.findOne({ room, members: uid, endedAt: { $exists: false } }).select('joined');
+          if (!priorCall) throw httpError(403, 'Call invite required');
+          const wasPreviouslyJoined = priorCall.joined.some(member => String(member) === uid);
           const call = await Call.findOneAndUpdate(
             { room, members: uid, endedAt: { $exists: false } },
             { $addToSet: { joined: uid } },
             { new: true }
           );
           if (!call) throw httpError(403, 'Call invite required');
+          clearTimeout(reconnectTimers.get(reconnectKey));
+          reconnectTimers.delete(reconnectKey);
+          const reconnected = wasPreviouslyJoined &&
+            (!wasInRoom || (priorSocket !== undefined && priorSocket !== socket));
           if (String(call.createdBy) !== uid) {
             await Call.updateOne({ _id: call.id }, { $set: { answeredAt: new Date() } });
           }
           const participants = rooms.get(room) || new Set();
+          if (reconnected && wasInRoom) {
+            participants.forEach(id => {
+              if (id !== uid) send(id, { t: 'call-left', room, id: uid });
+            });
+          }
           socket.send(JSON.stringify({ t: 'call-peers', room, ids: [...participants].filter(id => id !== uid) }));
           participants.add(uid);
           rooms.set(room, participants);
+          callSockets.set(reconnectKey, socket);
           participants.forEach(id => {
-            if (id !== uid) send(id, { t: 'call-joined', room, id: uid });
+            if (id !== uid) send(id, {
+              t: 'call-joined',
+              room,
+              id: uid,
+              ...(reconnected ? {
+                reconnected: true,
+                from: uid,
+                fromName: user.displayName,
+                fromUsername: user.username,
+                chat: call.chatKey,
+                group: call.group && String(call.group),
+                at: new Date().toISOString()
+              } : {})
+            });
           });
           break;
         }
         case 'call-leave': {
           if (typeof event.room !== 'string') throw httpError(400, 'Invalid call room');
-          if (rooms.get(event.room)?.has(uid)) await endCall(event.room);
+          if (ownsCallSocket(event.room, uid, socket) && rooms.get(event.room)?.has(uid)) {
+            await endCall(event.room);
+          }
           break;
         }
         case 'call-decline': {
@@ -1103,7 +1174,8 @@ wss.on('connection', async (socket, req) => {
         case 'sig': {
           const room = event.room;
           const peerId = requireObjectId(event.to, 'recipient id');
-          if (typeof room !== 'string' || !rooms.get(room)?.has(uid) || !rooms.get(room)?.has(peerId)) {
+          if (typeof room !== 'string' || !ownsCallSocket(room, uid, socket) ||
+              !rooms.get(room)?.has(uid) || !rooms.get(room)?.has(peerId)) {
             throw httpError(403, 'Both call participants must have joined');
           }
           if (!await Call.exists({ room, members: { $all: [uid, peerId] }, endedAt: { $exists: false } })) {
@@ -1117,28 +1189,46 @@ wss.on('connection', async (socket, req) => {
       }
     };
 
-    socket.on('message', async raw => {
-      try {
-        await handle(JSON.parse(raw.toString()));
-      } catch (error) {
-        let clientId;
+    let eventQueue = Promise.resolve();
+    socket.on('message', raw => {
+      eventQueue = eventQueue.then(async () => {
+        let event;
         try {
-          const event = JSON.parse(raw.toString());
-          if (typeof event?.clientId === 'string') clientId = event.clientId;
-        } catch {}
-        socket.send(JSON.stringify({ t: 'error', error: error.status ? error.message : 'Request failed', clientId }));
-        if (!error.status) console.error('WebSocket request failed:', error);
-      }
+          event = JSON.parse(raw.toString());
+          await handle(event);
+        } catch (error) {
+          const response = {
+            t: 'error',
+            error: error.status ? error.message : 'Request failed',
+            ...(typeof event?.clientId === 'string' ? { clientId: event.clientId } : {}),
+            ...(typeof event?.type === 'string' || typeof event?.t === 'string'
+              ? { eventType: event.type || event.t }
+              : {}),
+            ...(typeof event?.room === 'string' ? { room: event.room } : {})
+          };
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(response));
+          if (!error.status) console.error('WebSocket request failed:', error);
+        }
+      });
     });
     socket.on('close', async () => {
       online.get(uid)?.delete(socket);
+      for (const [room, participants] of rooms) {
+        const reconnectKey = `${room}:${uid}`;
+        if (!participants.has(uid) || callSockets.get(reconnectKey) !== socket) continue;
+        callSockets.delete(reconnectKey);
+        participants.delete(uid);
+        participants.forEach(id => send(id, { t: 'call-left', room, id: uid }));
+        clearTimeout(reconnectTimers.get(reconnectKey));
+        const timer = setTimeout(() => {
+          reconnectTimers.delete(reconnectKey);
+          if (rooms.get(room)?.has(uid)) return;
+          void endCall(room).catch(error => console.error('Call recovery cleanup failed:', error));
+        }, CALL_RECONNECT_GRACE_MS);
+        reconnectTimers.set(reconnectKey, timer);
+      }
       if (!online.get(uid)?.size) {
         online.delete(uid);
-        for (const [room, participants] of rooms) {
-          if (participants.has(uid)) {
-            void endCall(room).catch(error => console.error('Call cleanup failed:', error));
-          }
-        }
         const lastSeenAt = new Date();
         try {
           await User.updateOne({ _id: uid }, { $set: { lastSeenAt } });
