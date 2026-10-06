@@ -3,6 +3,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
 import express from 'express';
+import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import helmet from 'helmet';
 import multer from 'multer';
@@ -12,6 +13,7 @@ import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
+import { createClient } from '@supabase/supabase-js';
 import { User, Group, Chat, Message, Media, Call } from './models.js';
 
 const {
@@ -20,6 +22,8 @@ const {
   MONGO_URI,
   MONGO_DNS_SERVERS,
   GOOGLE_CLIENT_ID,
+  SUPABASE_URL,
+  SUPABASE_SECRET_KEY,
   PORT = 4000,
   ORIGIN = 'http://192.168.1.83:8000,http://localhost:8000'
 } = process.env;
@@ -43,12 +47,18 @@ if (MONGO_DNS_SERVERS) {
 const mongoUri = MONGO_URI.trim();
 const keyBytes = Buffer.from(ENC_KEY, 'hex');
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+const supabaseAdmin = SUPABASE_URL && SUPABASE_SECRET_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false }
+  })
+  : null;
 const origins = ORIGIN.split(',').map(value => value.trim()).filter(Boolean);
 const publicUser = user => ({ id: user.id, username: user.username, displayName: user.displayName, avatarUrl: user.avatarUrl });
 const currentUser = user => ({
   ...publicUser(user),
   email: user.email,
   activeStatus: user.activeStatus,
+  lastSeenAt: user.lastSeenAt,
   theme: user.theme
 });
 const chatKey = (first, second) => [String(first), String(second)].sort().join(':');
@@ -65,12 +75,18 @@ const decrypt = value => {
 };
 const messageResponse = message => ({
   id: message.id,
+  chat: message.chat && String(message.chat),
   from: String(message.from),
   to: message.to && String(message.to),
   group: message.group && String(message.group),
   kind: message.kind,
-  text: message.deleted ? 'This message was deleted' : decrypt(message.ct).toString(),
+  text: message.deleted
+    ? 'This message was deleted'
+    : message.ct ? decrypt(message.ct).toString() : message.content,
+  content: message.deleted ? '' : message.content,
+  mediaUrl: message.mediaUrl,
   status: message.status,
+  readBy: (message.readBy || []).map(String),
   edited: message.edited,
   deleted: message.deleted,
   at: message.createdAt
@@ -80,6 +96,13 @@ const signToken = user => jwt.sign(
   JWT_SECRET,
   { algorithm: 'HS256', expiresIn: '30d', issuer: 'chatapp', audience: 'chatapp-api' }
 );
+const setAuthCookie = (res, token) => res.cookie('chat_token', token, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'none',
+  path: '/',
+  maxAge: 30 * 24 * 60 * 60 * 1000
+});
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 const requireObjectId = (value, label = 'id') => {
   if (!mongoose.isValidObjectId(value)) throw httpError(400, `Invalid ${label}`);
@@ -91,13 +114,14 @@ const normalizeUsername = value => String(value || '').toLowerCase().replace(/^@
 const app = express();
 app.disable('x-powered-by');
 app.use(helmet());
-app.use(cors({ origin: origins }));
+app.use(cors({ origin: origins, credentials: true }));
+app.use(cookieParser());
 app.use(express.json({ limit: '100kb' }));
 app.get('/healthz', (req, res) => res.json({ ok: mongoose.connection.readyState === 1 }));
 
 const auth = (req, res, next) => {
   const header = req.get('authorization') || '';
-  const token = /^Bearer\s+(.+)$/i.exec(header)?.[1];
+  const token = req.cookies?.chat_token || /^Bearer\s+(.+)$/i.exec(header)?.[1];
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET, {
@@ -122,7 +146,8 @@ const authRateLimit = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many authentication attempts; try again later' }
 });
-const online = new Map();
+const connectedClients = new Map();
+const online = connectedClients;
 const rooms = new Map();
 const active = new Set();
 const send = (id, data) => {
@@ -137,7 +162,7 @@ const endCall = async (room, endReason = 'ended') => {
     { room, endedAt: { $exists: false } },
     { $set: { endedAt: new Date(), joined: [], endReason } },
     { new: true }
-  ).select('members chat group');
+  ).select('members chat chatKey group');
   const recipients = new Set([
     ...participants,
     ...(call?.members || []).map(String)
@@ -145,15 +170,37 @@ const endCall = async (room, endReason = 'ended') => {
   recipients.forEach(id => send(id, {
     t: 'call-ended',
     room,
-    chat: call?.chat,
+    chat: call?.chatKey || (call?.chat && String(call.chat)),
     group: call?.group && String(call.group)
   }));
 };
-const presence = (id, isOnline) => {
+const presence = (id, isOnline, lastSeenAt) => {
   if (isOnline) active.add(String(id));
   else active.delete(String(id));
-  online.forEach((_, recipient) => send(recipient, { t: 'presence', id: String(id), on: isOnline }));
+  online.forEach((_, recipient) => {
+    send(recipient, {
+      type: 'PRESENCE',
+      status: isOnline ? 'ONLINE' : 'OFFLINE',
+      userId: String(id),
+      lastSeenAt: lastSeenAt || null
+    });
+    send(recipient, { t: 'presence', id: String(id), on: isOnline, lastSeenAt: lastSeenAt || null });
+  });
 };
+const chatMemberIds = chat => chat.members.map(member => String(member.user));
+const chatMember = (chat, userId) => chat.members.find(member => String(member.user) === String(userId));
+const ensureChat = (key, kind, members, group) => Chat.findOneAndUpdate(
+  { key },
+  {
+    $setOnInsert: {
+      key,
+      kind,
+      members: members.map(user => ({ user })),
+      ...(group ? { group } : {})
+    }
+  },
+  { upsert: true, new: true, runValidators: true }
+);
 const groupMembers = async groupId => {
   const group = await Group.findById(groupId).select('members');
   if (!group) throw httpError(404, 'Group not found');
@@ -167,30 +214,68 @@ const notifyMessageParticipants = async message => {
 };
 const notifyMessageSender = message => send(String(message.from), { t: 'upd', m: messageResponse(message) });
 const backfillChats = async () => {
+  const migratedChatIds = new Set();
+  const storedChats = await Chat.collection.find({}).toArray();
+  for (const storedChat of storedChats) {
+    const legacyMembers = (storedChat.members || []).filter(member => member?.toHexString);
+    if (legacyMembers.length) {
+      migratedChatIds.add(String(storedChat._id));
+      await Chat.collection.updateOne(
+        { _id: storedChat._id },
+        {
+          $set: {
+            members: storedChat.members.map(member => member?.toHexString
+              ? { user: member, unreadCount: 0 }
+              : member)
+          }
+        }
+      );
+    }
+  }
   const groups = await Group.find().select('_id members');
   for (const group of groups) {
-    await Chat.updateOne(
-      { key: String(group.id) },
-      { $setOnInsert: { key: String(group.id), kind: 'group', group: group.id, members: group.members } },
-      { upsert: true }
+    const chat = await ensureChat(String(group.id), 'group', group.members, group.id);
+    const result = await Message.collection.updateMany(
+      { chat: String(group.id) },
+      { $set: { chat: chat._id } }
     );
+    if (result.modifiedCount) migratedChatIds.add(String(chat.id));
   }
   const directChats = await Message.aggregate([
-    { $match: { group: null, to: { $ne: null } } },
+    { $match: { chat: { $type: 'string' }, group: null, to: { $ne: null } } },
     { $group: { _id: '$chat', senders: { $addToSet: '$from' }, recipients: { $addToSet: '$to' } } }
   ]);
   for (const chat of directChats) {
-    await Chat.updateOne(
-      { key: chat._id },
-      {
-        $setOnInsert: {
-          key: chat._id,
-          kind: 'direct',
-          members: [...new Set([...chat.senders, ...chat.recipients].map(String))]
-        }
-      },
-      { upsert: true }
-    );
+    const members = [...new Set([...chat.senders, ...chat.recipients].map(String))];
+    const chatDoc = await ensureChat(chat._id, 'direct', members);
+    await Message.collection.updateMany({ chat: chat._id }, { $set: { chat: chatDoc._id } });
+    migratedChatIds.add(String(chatDoc.id));
+  }
+  for (const id of migratedChatIds) {
+    const chat = await Chat.findById(id);
+    if (!chat) continue;
+    await Promise.all(chat.members.map(async member => {
+      const userId = String(member.user);
+      const unreadCount = await Message.countDocuments({
+        chat: chat._id,
+        from: { $ne: userId },
+        status: { $ne: 'seen' }
+      });
+      await Chat.updateOne(
+        { _id: chat._id, 'members.user': userId },
+        { $set: { 'members.$.unreadCount': unreadCount } }
+      );
+    }));
+  }
+  const legacyCalls = await Call.collection.find({ chat: { $type: 'string' } }).toArray();
+  for (const call of legacyCalls) {
+    const chatDoc = await Chat.findOne({ key: call.chat });
+    if (chatDoc) {
+      await Call.collection.updateOne(
+        { _id: call._id },
+        { $set: { chatKey: call.chat, chat: chatDoc._id } }
+      );
+    }
   }
 };
 
@@ -223,7 +308,9 @@ app.post('/api/auth/google', authRateLimit, asyncRoute(async (req, res) => {
       avatarUrl: claims.picture
     });
   }
-  res.json({ token: signToken(user), user: currentUser(user) });
+  const token = signToken(user);
+  setAuthCookie(res, token);
+  res.json({ token, user: currentUser(user) });
 }));
 
 app.post('/api/auth/setup', auth, asyncRoute(async (req, res) => {
@@ -256,7 +343,9 @@ app.post('/api/auth/login', authRateLimit, asyncRoute(async (req, res) => {
   if (!user?.passwordHash || !await bcrypt.compare(password, user.passwordHash)) {
     throw httpError(401, 'Invalid username or password');
   }
-  res.json({ token: signToken(user), user: currentUser(user) });
+  const token = signToken(user);
+  setAuthCookie(res, token);
+  res.json({ token, user: currentUser(user) });
 }));
 
 app.post('/api/auth/check-username', authRateLimit, asyncRoute(async (req, res) => {
@@ -287,6 +376,7 @@ app.patch('/api/me', auth, asyncRoute(async (req, res) => {
   if (activeStatus !== undefined) {
     if (typeof activeStatus !== 'boolean') throw httpError(400, 'activeStatus must be a boolean');
     user.activeStatus = activeStatus;
+    if (!activeStatus) user.lastSeenAt = new Date();
   }
   if (theme !== undefined) {
     if (!theme || typeof theme !== 'object' || Array.isArray(theme)) throw httpError(400, 'Invalid theme');
@@ -296,7 +386,7 @@ app.patch('/api/me', auth, asyncRoute(async (req, res) => {
     };
   }
   await user.save();
-  presence(user.id, user.activeStatus && online.has(user.id));
+  presence(user.id, user.activeStatus && online.has(user.id), user.lastSeenAt);
   res.json(currentUser(user));
 }));
 
@@ -311,20 +401,13 @@ app.get('/api/users/search', auth, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/chats', auth, asyncRoute(async (req, res) => {
-  const chats = await Chat.find({ members: req.uid }).sort({ lastMessageAt: -1, updatedAt: -1 }).limit(100);
-  const chatKeys = chats.map(chat => chat.key);
+  const chats = await Chat.find({ 'members.user': req.uid })
+    .sort({ lastMessageAt: -1, updatedAt: -1 }).limit(100);
   const messageIds = chats.map(chat => chat.lastMessage).filter(Boolean);
-  const [latestMessages, unreadRows] = await Promise.all([
-    messageIds.length ? Message.find({ _id: { $in: messageIds } }) : [],
-    chatKeys.length ? Message.aggregate([
-      { $match: { chat: { $in: chatKeys }, from: { $ne: new mongoose.Types.ObjectId(req.uid) }, status: { $ne: 'seen' } } },
-      { $group: { _id: '$chat', count: { $sum: 1 } } }
-    ]) : []
-  ]);
+  const latestMessages = messageIds.length ? await Message.find({ _id: { $in: messageIds } }) : [];
   const messageById = new Map(latestMessages.map(message => [String(message.id), messageResponse(message)]));
-  const unreadByChat = new Map(unreadRows.map(row => [row._id, row.count]));
   const peerIds = [...new Set(chats.filter(chat => chat.kind === 'direct')
-    .flatMap(chat => chat.members.map(String).filter(id => id !== req.uid)))];
+    .flatMap(chat => chatMemberIds(chat).filter(id => id !== req.uid)))];
   const users = await User.find({ _id: { $in: peerIds } }).select('username displayName avatarUrl');
   const groupIds = chats.filter(chat => chat.kind === 'group').map(chat => chat.group);
   const groups = await Group.find({ _id: { $in: groupIds } })
@@ -337,13 +420,14 @@ app.get('/api/chats', auth, asyncRoute(async (req, res) => {
       members: group.members.map(publicUser)
     })),
     chats: chats.map(chat => ({
-      id: chat.group ? String(chat.group) : chat.members.map(String).find(id => id !== req.uid),
+      id: chat.group ? String(chat.group) : chatMemberIds(chat).find(id => id !== req.uid),
+      chatId: String(chat.id),
       kind: chat.kind,
-      members: chat.members.map(String),
+      members: chatMemberIds(chat),
       group: chat.group && String(chat.group),
       lastMessageAt: chat.lastMessageAt,
       lastMessage: chat.lastMessage ? messageById.get(String(chat.lastMessage)) || null : null,
-      unreadCount: unreadByChat.get(chat.key) || 0
+      unreadCount: chatMember(chat, req.uid)?.unreadCount || 0
     }))
   });
 }));
@@ -360,8 +444,8 @@ app.post('/api/groups', auth, asyncRoute(async (req, res) => {
     throw httpError(400, 'One or more usernames are invalid');
   }
   const members = [...new Set([req.uid, ...users.map(user => String(user.id))])];
-  const group = await Group.create({ name, owner: req.uid, members });
-  await Chat.create({ key: String(group.id), kind: 'group', group: group.id, members });
+  const group = await Group.create({ name, owner: req.uid, admins: [req.uid], members });
+  await ensureChat(String(group.id), 'group', members, group.id);
   res.status(201).json({ id: group.id });
 }));
 
@@ -379,7 +463,11 @@ app.get('/api/messages/:id', auth, asyncRoute(async (req, res) => {
     if (peerId === req.uid || !await User.exists({ _id: peerId })) throw httpError(404, 'Chat not found');
     chat = chatKey(req.uid, peerId);
   }
-  const filter = { chat };
+  const chatDoc = groupChat
+    ? await Chat.findOne({ key: chat })
+    : await ensureChat(chat, 'direct', [req.uid, req.params.id]);
+  if (!chatDoc || !chatMember(chatDoc, req.uid)) throw httpError(403, 'Forbidden');
+  const filter = { chat: chatDoc._id };
   if (req.query.before !== undefined) {
     const before = new Date(String(req.query.before));
     if (Number.isNaN(before.getTime())) throw httpError(400, 'Invalid before timestamp');
@@ -421,8 +509,15 @@ app.get('/api/calls/:id', auth, asyncRoute(async (req, res) => {
     chat = chatKey(req.uid, peerId);
   }
 
-  const callFilter = {
+  const chatDoc = await ensureChat(
     chat,
+    groupId ? 'group' : 'direct',
+    groupId ? await groupMembers(groupId) : [req.uid, String(req.params.id)],
+    groupId
+  );
+  const callFilter = {
+    chat: chatDoc._id,
+    chatKey: chat,
     ...(groupId ? { group: groupId } : { group: { $exists: false }, members: { $all: [req.uid, String(req.params.id)] } })
   };
   const calls = await Call.find(callFilter)
@@ -466,6 +561,88 @@ app.post('/api/upload', auth, upload.single('file'), asyncRoute(async (req, res)
   res.status(201).json({ id: media.id });
 }));
 
+app.post('/api/media/upload-url', auth, asyncRoute(async (req, res) => {
+  if (!supabaseAdmin) throw httpError(503, 'Supabase Storage is not configured');
+  const { folder, mime, size } = req.body || {};
+  const uploadFolder = folder || 'conversations';
+  if (!['conversations', 'profiles'].includes(uploadFolder)) {
+    throw httpError(400, 'folder must be conversations or profiles');
+  }
+  if (typeof mime !== 'string' || !/^image\/(jpeg|png|webp|avif)$/i.test(mime) ||
+      !Number.isInteger(size) || size < 1 || size > 500_000) {
+    throw httpError(400, 'Image must be no larger than 500,000 bytes');
+  }
+  const extension = ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/avif': 'avif' })[mime.toLowerCase()];
+  const fileKey = `${uploadFolder}/${req.uid}/${crypto.randomUUID()}.${extension}`;
+  const { data, error } = await supabaseAdmin.storage.from('metufy')
+    .createSignedUploadUrl(fileKey, { upsert: false });
+  if (error) throw httpError(502, `Could not prepare media upload: ${error.message}`);
+  res.json({ fileKey, token: data.token });
+}));
+
+app.post('/api/media/complete', auth, asyncRoute(async (req, res) => {
+  if (!supabaseAdmin) throw httpError(503, 'Supabase Storage is not configured');
+  const { folder, fileKey, mime, size } = req.body || {};
+  const uploadFolder = folder || 'conversations';
+  const keyPattern = new RegExp(`^${uploadFolder}/${req.uid}/[0-9a-f-]{36}\\.(jpg|png|webp|avif)$`);
+  if (!['conversations', 'profiles'].includes(uploadFolder) ||
+      typeof fileKey !== 'string' || !keyPattern.test(fileKey) ||
+      typeof mime !== 'string' || !Number.isInteger(size) ||
+      size < 1 || size > 500_000) {
+    throw httpError(400, 'Invalid uploaded media metadata');
+  }
+  const slash = fileKey.lastIndexOf('/');
+  const storageFolder = fileKey.slice(0, slash);
+  const filename = fileKey.slice(slash + 1);
+  const bucket = supabaseAdmin.storage.from('metufy');
+  const { data: files, error } = await bucket
+    .list(storageFolder, { search: filename, limit: 10 });
+  if (error) throw httpError(502, `Could not verify media upload: ${error.message}`);
+  const uploadedFile = files.find(file => file.name === filename);
+  if (!uploadedFile || uploadedFile.metadata?.size !== size ||
+      uploadedFile.metadata?.size > 500_000 ||
+      uploadedFile.metadata?.mimetype !== mime) {
+    if (uploadedFile) {
+      const { error: cleanupError } = await bucket.remove([fileKey]);
+      if (cleanupError) console.error('Rejected Supabase upload cleanup failed:', cleanupError.message);
+    }
+    throw httpError(400, 'Uploaded file metadata does not match');
+  }
+  const existing = await Media.findOne({ owner: req.uid, fileKey });
+  if (existing) {
+    if (uploadFolder === 'profiles') {
+      await User.updateOne({ _id: req.uid }, { $set: { avatarUrl: existing.url } });
+    }
+    return res.status(200).json({
+      id: existing.id,
+      fileKey: existing.fileKey,
+      url: existing.url,
+      mime: existing.mime,
+      size: existing.size,
+      folder: uploadFolder
+    });
+  }
+  const { data: publicData } = bucket.getPublicUrl(fileKey);
+  const media = await Media.create({
+    owner: req.uid,
+    fileKey,
+    url: publicData.publicUrl,
+    mime,
+    size
+  });
+  if (uploadFolder === 'profiles') {
+    await User.updateOne({ _id: req.uid }, { $set: { avatarUrl: media.url } });
+  }
+  res.status(201).json({
+    id: media.id,
+    fileKey: media.fileKey,
+    url: media.url,
+    mime: media.mime,
+    size: media.size,
+    folder: uploadFolder
+  });
+}));
+
 app.get('/api/media/:id', auth, asyncRoute(async (req, res) => {
   const id = requireObjectId(req.params.id, 'media id');
   const media = await Media.findOne({ _id: id, access: req.uid });
@@ -474,43 +651,186 @@ app.get('/api/media/:id', auth, asyncRoute(async (req, res) => {
 }));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
 wss.on('connection', async (socket, req) => {
-  const origin = req.headers.origin;
-  if (origin && !origins.includes(origin)) return socket.close(4003, 'Origin not allowed');
-  let uid;
-  try {
-    const token = new URL(req.url, 'http://localhost').searchParams.get('token');
-    const payload = jwt.verify(token, JWT_SECRET, {
-      algorithms: ['HS256'],
-      issuer: 'chatapp',
-      audience: 'chatapp-api'
-    });
-    if (typeof payload === 'string' || typeof payload.id !== 'string' || !mongoose.isValidObjectId(payload.id)) {
-      return socket.close(4001, 'Unauthorized');
-    }
-    uid = payload.id;
-  } catch {
-    return socket.close(4001, 'Unauthorized');
-  }
+  const uid = req.user?.id;
+  if (!uid) return socket.close(4001, 'Unauthorized');
 
   try {
     const user = await User.findById(uid);
     if (!user) return socket.close(4001, 'Unauthorized');
+    const alreadyConnected = online.has(uid) && online.get(uid).size > 0;
     if (!online.has(uid)) online.set(uid, new Set());
     online.get(uid).add(socket);
-    if (user.activeStatus) presence(uid, true);
+    if (user.activeStatus && !alreadyConnected) presence(uid, true, user.lastSeenAt);
     socket.send(JSON.stringify({ t: 'online', ids: [...active] }));
 
     const handle = async event => {
-      if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.t !== 'string') {
+      if (!event || typeof event !== 'object' || Array.isArray(event) ||
+          (typeof event.t !== 'string' && typeof event.type !== 'string')) {
         throw httpError(400, 'Invalid event');
       }
-      switch (event.t) {
+      switch (event.type || event.t) {
+        case 'SEND_MESSAGE': {
+          const clientId = event.clientId;
+          const kind = event.kind || 'text';
+          const content = event.content ?? event.text ?? '';
+          if (!['text', 'image', 'audio', 'video', 'file'].includes(kind) ||
+              typeof content !== 'string' || content.length > 4000) {
+            throw httpError(400, 'Invalid message');
+          }
+          if (clientId !== undefined && (typeof clientId !== 'string' || !clientId || clientId.length > 128)) {
+            throw httpError(400, 'Invalid message identifier');
+          }
+          let chatDoc;
+          const chatId = event.chatId || event.targetChatId || event.chat;
+          if (typeof chatId === 'string' && mongoose.isValidObjectId(chatId)) {
+            chatDoc = await Chat.findById(chatId);
+            if (!chatDoc) chatDoc = await Chat.findOne({ key: chatId });
+            if (!chatDoc && chatId !== uid && await User.exists({ _id: chatId })) {
+              chatDoc = await ensureChat(chatKey(uid, chatId), 'direct', [uid, chatId]);
+            }
+          } else if (typeof chatId === 'string') {
+            chatDoc = await Chat.findOne({ key: chatId });
+          }
+          if (!chatDoc || !chatMember(chatDoc, uid)) throw httpError(403, 'Forbidden');
+          if (kind === 'text' && !content.trim()) throw httpError(400, 'Message cannot be empty');
+          let mediaUrl;
+          if (kind !== 'text') {
+            if (typeof event.mediaUrl !== 'string' || event.mediaUrl.length > 2048) {
+              throw httpError(400, 'A valid mediaUrl is required');
+            }
+            let parsedUrl;
+            try {
+              parsedUrl = new URL(event.mediaUrl);
+            } catch {
+              throw httpError(400, 'Invalid mediaUrl');
+            }
+            if (parsedUrl.protocol !== 'https:') throw httpError(400, 'Media URL must use HTTPS');
+            const media = await Media.findOne({ owner: uid, url: parsedUrl.href }).select('mime');
+            if (!media || (kind === 'image' && !media.mime.startsWith('image/')) ||
+                (kind === 'audio' && !media.mime.startsWith('audio/')) ||
+                (kind === 'video' && !media.mime.startsWith('video/'))) {
+              throw httpError(400, 'Media must be uploaded by the sender before messaging');
+            }
+            mediaUrl = parsedUrl.href;
+          }
+          if (clientId) {
+            const previous = await Message.findOne({ from: uid, clientId });
+            if (previous) {
+              socket.send(JSON.stringify({
+                type: 'SEND_MESSAGE_ACK',
+                messageId: previous.id,
+                clientId,
+                message: messageResponse(previous)
+              }));
+              break;
+            }
+          }
+          const recipients = chatMemberIds(chatDoc);
+          const peerId = recipients.find(id => id !== uid);
+          let message;
+          try {
+            message = await Message.create({
+              chat: chatDoc._id,
+              from: uid,
+              to: chatDoc.kind === 'direct' ? peerId : undefined,
+              group: chatDoc.group,
+              clientId,
+              kind,
+              content: kind === 'text' ? content : '',
+              mediaUrl,
+              readBy: [uid],
+              status: 'sent'
+            });
+          } catch (error) {
+            if (error.code !== 11000 || !clientId) throw error;
+            message = await Message.findOne({ from: uid, clientId });
+            if (!message) throw error;
+            socket.send(JSON.stringify({
+              type: 'SEND_MESSAGE_ACK',
+              messageId: message.id,
+              clientId,
+              message: messageResponse(message)
+            }));
+            break;
+          }
+          await Chat.updateOne(
+            { _id: chatDoc._id },
+            { $set: { lastMessage: message.id, lastMessageAt: message.createdAt } }
+          );
+          await Promise.all(recipients.filter(id => id !== uid && !active.has(id)).map(id =>
+            Chat.updateOne(
+              { _id: chatDoc._id, 'members.user': id },
+              { $inc: { 'members.$.unreadCount': 1 } }
+            )
+          ));
+          const payload = {
+            ...messageResponse(message),
+            chatId: String(chatDoc.id),
+            createdAt: message.createdAt
+          };
+          socket.send(JSON.stringify({
+            type: 'SEND_MESSAGE_ACK',
+            messageId: message.id,
+            clientId,
+            message: payload
+          }));
+          recipients.filter(id => id !== uid && active.has(id)).forEach(id =>
+            send(id, { type: 'MESSAGE', message: payload })
+          );
+          break;
+        }
+        case 'MARK_READ': {
+          const chatId = event.chatId || event.targetChatId || event.chat;
+          let chatDoc;
+          if (typeof chatId === 'string' && mongoose.isValidObjectId(chatId)) {
+            chatDoc = await Chat.findById(chatId);
+            if (!chatDoc) chatDoc = await Chat.findOne({ key: chatId });
+            if (!chatDoc && chatId !== uid && await User.exists({ _id: chatId })) {
+              chatDoc = await ensureChat(chatKey(uid, chatId), 'direct', [uid, chatId]);
+            }
+          } else if (typeof chatId === 'string') {
+            chatDoc = await Chat.findOne({ key: chatId });
+          }
+          if (!chatDoc || !chatMember(chatDoc, uid)) throw httpError(403, 'Forbidden');
+          const lastReadMessageAt = new Date();
+          await Chat.updateOne(
+            { _id: chatDoc._id, 'members.user': uid },
+            { $set: { 'members.$.unreadCount': 0, 'members.$.lastReadMessageAt': lastReadMessageAt } }
+          );
+          await Message.updateMany(
+            { chat: chatDoc._id, from: { $ne: uid } },
+            { $addToSet: { readBy: uid }, $set: { status: 'seen' } }
+          );
+          const senders = await Message.distinct('from', { chat: chatDoc._id, from: { $ne: uid } });
+          senders.forEach(sender => send(String(sender), {
+            type: 'MESSAGES_READ',
+            chatId: String(chatDoc.id),
+            userId: uid,
+            lastReadMessageAt
+          }));
+          break;
+        }
+        case 'WEBRTC_SIGNAL': {
+          const room = event.room;
+          const peerId = requireObjectId(event.to || event.targetUserId, 'recipient id');
+          if (typeof room !== 'string' || !rooms.get(room)?.has(uid) || !rooms.get(room)?.has(peerId)) {
+            throw httpError(403, 'Both call participants must have joined');
+          }
+          if (!await Call.exists({ room, members: { $all: [uid, peerId] }, endedAt: { $exists: false } })) {
+            throw httpError(403, 'Call not found');
+          }
+          const signal = event.signal || event.sdp || event.candidate;
+          if (!signal || typeof signal !== 'object') throw httpError(400, 'Invalid WebRTC signal');
+          send(peerId, { type: 'WEBRTC_SIGNAL', from: uid, room, signal });
+          break;
+        }
         case 'msg': {
           const kind = event.kind || 'text';
-          if (!['text', 'image', 'audio'].includes(kind) || typeof event.text !== 'string' || event.text.length > 4000) {
+          if (!['text', 'image', 'audio', 'video', 'file'].includes(kind) ||
+              typeof event.text !== 'string' || event.text.length > 4000) {
             throw httpError(400, 'Invalid message');
           }
           if (event.clientId !== undefined && (typeof event.clientId !== 'string' || event.clientId.length > 128)) {
@@ -547,28 +867,27 @@ wss.on('connection', async (socket, req) => {
             const mediaId = requireObjectId(content, 'media id');
             media = await Media.findOne({ _id: mediaId, owner: uid });
             if (!media || (kind === 'image' && !media.mime.startsWith('image/')) ||
-                (kind === 'audio' && !media.mime.startsWith('audio/'))) {
+                (kind === 'audio' && !media.mime.startsWith('audio/')) ||
+                (kind === 'video' && !media.mime.startsWith('video/'))) {
               throw httpError(400, 'Invalid media attachment');
             }
             content = mediaId;
             await Media.updateOne({ _id: mediaId }, { $addToSet: { access: { $each: recipients } } });
           }
 
-          await Chat.findOneAndUpdate(
-            { key: chat },
-            { $setOnInsert: { key: chat, kind: groupId ? 'group' : 'direct', members: recipients, group: groupId } },
-            { upsert: true, new: true, runValidators: true }
-          );
+          const chatDoc = await ensureChat(chat, groupId ? 'group' : 'direct', recipients, groupId);
           let message, inserted = true;
           try {
             message = await Message.create({
-              chat,
+              chat: chatDoc._id,
               from: uid,
               to: groupId ? undefined : recipients.find(recipient => recipient !== uid),
               group: groupId,
               clientId: event.clientId,
               kind,
+              content: '',
               ct: encrypt(Buffer.from(content)),
+              readBy: [uid],
               status: 'sent'
             });
           } catch (error) {
@@ -578,7 +897,16 @@ wss.on('connection', async (socket, req) => {
             inserted = false;
           }
           if (inserted) {
-            await Chat.updateOne({ key: chat }, { lastMessage: message.id, lastMessageAt: message.createdAt });
+            await Chat.updateOne(
+              { _id: chatDoc._id },
+              { $set: { lastMessage: message.id, lastMessageAt: message.createdAt } }
+            );
+            await Promise.all(recipients.filter(id => id !== uid && !active.has(id)).map(id =>
+              Chat.updateOne(
+                { _id: chatDoc._id, 'members.user': id },
+                { $inc: { 'members.$.unreadCount': 1 } }
+              )
+            ));
           }
           recipients.forEach(recipient => send(recipient, { t: 'msg', m: messageResponse(message) }));
           if (typeof event.clientId === 'string') {
@@ -605,14 +933,34 @@ wss.on('connection', async (socket, req) => {
             const groupId = requireObjectId(event.group, 'group id');
             const members = await groupMembers(groupId);
             if (!members.includes(uid)) throw httpError(403, 'Forbidden');
-            await Message.updateMany({ chat: groupId, from: { $ne: uid }, status: { $ne: 'seen' } }, { status: 'seen' });
+            const chatDoc = await Chat.findOne({ key: groupId });
+            if (!chatDoc) throw httpError(404, 'Chat not found');
+            await Chat.updateOne(
+              { _id: chatDoc._id, 'members.user': uid },
+              { $set: { 'members.$.unreadCount': 0, 'members.$.lastReadMessageAt': new Date() } }
+            );
+            await Message.updateMany(
+              { chat: chatDoc._id, from: { $ne: uid }, status: { $ne: 'seen' } },
+              { $set: { status: 'seen' }, $addToSet: { readBy: uid } }
+            );
             members.forEach(member => send(member, { t: 'seen', by: uid, group: groupId }));
           } else {
             const peerId = requireObjectId(event.chat, 'chat id');
-            if (!await Chat.exists({ key: chatKey(uid, peerId), members: { $all: [uid, peerId] } })) {
+            const directChat = await Chat.findOne({
+              key: chatKey(uid, peerId),
+              'members.user': { $all: [uid, peerId] }
+            });
+            if (!directChat) {
               throw httpError(403, 'Forbidden');
             }
-            await Message.updateMany({ chat: chatKey(uid, peerId), to: uid, status: { $ne: 'seen' } }, { status: 'seen' });
+            await Chat.updateOne(
+              { _id: directChat._id, 'members.user': uid },
+              { $set: { 'members.$.unreadCount': 0, 'members.$.lastReadMessageAt': new Date() } }
+            );
+            await Message.updateMany(
+              { chat: directChat._id, to: uid, status: { $ne: 'seen' } },
+              { $set: { status: 'seen' }, $addToSet: { readBy: uid } }
+            );
             send(peerId, { t: 'seen', by: uid });
           }
           break;
@@ -644,13 +992,19 @@ wss.on('connection', async (socket, req) => {
               throw httpError(403, 'Edit window (5 minutes) has passed');
             }
             message.ct = encrypt(Buffer.from(event.text));
+            message.content = event.text;
             message.edited = true;
           } else {
             if (message.kind !== 'text') {
-              const mediaId = decrypt(message.ct).toString();
-              if (mongoose.isValidObjectId(mediaId)) await Media.deleteOne({ _id: mediaId, owner: uid });
+              if (message.ct) {
+                const mediaId = decrypt(message.ct).toString();
+                if (mongoose.isValidObjectId(mediaId)) await Media.deleteOne({ _id: mediaId, owner: uid });
+              }
+              message.mediaUrl = undefined;
+              message.content = '';
             }
-            message.ct = encrypt(Buffer.alloc(0));
+            if (message.ct) message.ct = encrypt(Buffer.alloc(0));
+            message.content = '';
             message.deleted = true;
             message.kind = 'text';
           }
@@ -683,11 +1037,18 @@ wss.on('connection', async (socket, req) => {
             recipients.unshift(uid);
             callChat = chatKey(uid, recipients.find(id => id !== uid));
           }
+          const callChatDoc = await ensureChat(
+            callChat,
+            groupId ? 'group' : 'direct',
+            recipients,
+            groupId
+          );
           const existingCall = await Call.findOne({ room });
           if (existingCall) throw httpError(409, 'Call room is unavailable');
           const call = await Call.create({
             room,
-            chat: callChat,
+            chat: callChatDoc._id,
+            chatKey: callChat,
             group: groupId,
             createdBy: uid,
             members: [...new Set(recipients)],
@@ -695,7 +1056,7 @@ wss.on('connection', async (socket, req) => {
             video: Boolean(event.video)
           });
           if (!rooms.has(room)) rooms.set(room, new Set([uid]));
-          recipients.forEach(id => send(id, { t: 'call-log', room, chat: call.chat, group: groupId }));
+          recipients.forEach(id => send(id, { t: 'call-log', room, chat: callChat, group: groupId }));
           recipients.filter(id => id !== uid).forEach(id => send(id, {
             t: 'call-invite',
             from: uid,
@@ -769,7 +1130,7 @@ wss.on('connection', async (socket, req) => {
         if (!error.status) console.error('WebSocket request failed:', error);
       }
     });
-    socket.on('close', () => {
+    socket.on('close', async () => {
       online.get(uid)?.delete(socket);
       if (!online.get(uid)?.size) {
         online.delete(uid);
@@ -778,12 +1139,48 @@ wss.on('connection', async (socket, req) => {
             void endCall(room).catch(error => console.error('Call cleanup failed:', error));
           }
         }
-        presence(uid, false);
+        const lastSeenAt = new Date();
+        try {
+          await User.updateOne({ _id: uid }, { $set: { lastSeenAt } });
+          presence(uid, false, lastSeenAt);
+        } catch (error) {
+          console.error('Presence update failed:', error);
+        }
       }
     });
   } catch (error) {
     console.error('WebSocket connection setup failed:', error);
     socket.close(1011, 'Connection setup failed');
+  }
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const reject = (status, reason) => {
+    socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+  };
+  const requestPath = (req.url || '').split('?')[0];
+  if (requestPath !== '/ws') return reject(404, 'Not Found');
+  const origin = req.headers.origin;
+  if (origin && !origins.includes(origin)) return reject(403, 'Forbidden');
+  try {
+    const tokenCookie = (req.headers.cookie || '').split(';')
+      .map(value => value.trim())
+      .find(value => value.startsWith('chat_token='));
+    const token = tokenCookie && decodeURIComponent(tokenCookie.slice('chat_token='.length));
+    const payload = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],
+      issuer: 'chatapp',
+      audience: 'chatapp-api'
+    });
+    if (typeof payload === 'string' || typeof payload.id !== 'string' ||
+        !mongoose.isValidObjectId(payload.id)) {
+      return reject(401, 'Unauthorized');
+    }
+    req.user = { id: payload.id };
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  } catch {
+    reject(401, 'Unauthorized');
   }
 });
 

@@ -2,7 +2,7 @@
 
 Node.js API and WebSocket backend using MongoDB, verified Google sign-in, encrypted message/media content, group chats, and WebRTC call signaling.
 
-App sign-in tokens expire after 30 days. Image uploads are stored without resizing or recompression (maximum upload size: 15 MB), and displayed with their original aspect ratio. Message receipts progress from stored (`Sent`) to recipient-confirmed (`Delivered`) to chat-opened (`Seen`); ending or declining a call ends it for all participants.
+App sign-in tokens expire after 30 days. The legacy `/api/upload` endpoint stores encrypted media in MongoDB (maximum upload size: 15 MB). The browser `mediaUtils.js` utility resizes and compresses images before uploading them to Supabase Storage. Message receipts progress from stored (`Sent`) to recipient-confirmed (`Delivered`) to chat-opened (`Seen`); ending or declining a call ends it for all participants.
 
 ## Run locally
 
@@ -27,6 +27,14 @@ App sign-in tokens expire after 30 days. Image uploads are stored without resizi
    For development with automatic restart, run `npm run dev`.
 
 The API listens on port `4000` by default; its WebSocket endpoint is `/ws`. For mobile testing, connect the phone and development computer to the same Wi-Fi network and open `http://192.168.1.83:8000` on the phone. The Vite dev server binds to all network interfaces, and the client uses the current page's hostname for API/WebSocket connections. Google login expects a Google Identity Services ID token in `{ "credential": "..." }` at `POST /api/auth/google`. Send the returned app JWT as `Authorization: Bearer <token>` for HTTP APIs. The first sign-in creates a MongoDB `users` record; complete profile setup at `POST /api/auth/setup`.
+
+## Supabase image uploads
+
+Set `SUPABASE_URL` and a newly rotated `SUPABASE_SECRET_KEY` in the server environment. The secret key is used only by the server to mint short-lived, user-scoped upload URLs; never put it in frontend configuration. Set `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, and (if the API is on another origin) `VITE_API_URL` in the frontend build environment. Import `uploadImage` from `mediaUtils.js` and call it with the selected `File`. The HTTP-only `chat_token` cookie authenticates the upload-ticket and completion requests. Serve the API and frontend over HTTPS so the `Secure` cookie is sent for WebSocket upgrades.
+
+Create the `metufy` bucket in Supabase Storage and make it public if clients should receive durable, directly displayable URLs (the completion endpoint returns a public URL). Upload writes use signed upload tokens; do not add an unrestricted anonymous upload policy. Use `uploadConversationImage(file)` for chat images or `uploadProfilePhoto(file)` for profile photos. Objects are stored under `conversations/<user-id>/` and `profiles/<user-id>/` respectively; successful profile photo uploads also update the user's `avatarUrl`. Both helpers return `{ id, fileKey, url, mime, size, folder }`. Compressed images may be any size up to 500,000 bytes; there is no minimum size.
+
+The WebSocket accepts cookie-authenticated `SEND_MESSAGE`, `MARK_READ`, and `WEBRTC_SIGNAL` events and emits `SEND_MESSAGE_ACK`, `MESSAGE`, `MESSAGES_READ`, `PRESENCE`, and `WEBRTC_SIGNAL` events. Existing short-form client events remain supported.
 
 ## MongoDB data
 
