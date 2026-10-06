@@ -151,13 +151,31 @@ const online = connectedClients;
 const rooms = new Map();
 const callSockets = new Map();
 const reconnectTimers = new Map();
+const typingTimers = new Map();
 const CALL_RECONNECT_GRACE_MS = 45_000;
+const TYPING_IDLE_TIMEOUT_MS = 500;
 const active = new Set();
 const ownsCallSocket = (room, uid, socket) => callSockets.get(`${room}:${uid}`) === socket;
 const send = (id, data) => {
   online.get(String(id))?.forEach(socket => {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data));
   });
+};
+const stopTyping = key => {
+  const typing = typingTimers.get(key);
+  if (!typing) return;
+  clearTimeout(typing.timer);
+  typingTimers.delete(key);
+  typing.recipients.forEach(recipient => send(recipient, typing.stopEvent));
+};
+const relayTyping = (key, recipients, startEvent, stopEvent) => {
+  const previous = typingTimers.get(key);
+  if (previous) clearTimeout(previous.timer);
+  recipients.forEach(recipient => send(recipient, startEvent));
+  const timer = setTimeout(() => {
+    if (typingTimers.get(key)?.timer === timer) stopTyping(key);
+  }, TYPING_IDLE_TIMEOUT_MS);
+  typingTimers.set(key, { timer, recipients, stopEvent });
 };
 const endCall = async (room, endReason = 'ended') => {
   const participants = rooms.get(room) || new Set();
@@ -1007,12 +1025,32 @@ wss.on('connection', async (socket, req) => {
             const groupId = requireObjectId(event.group, 'group id');
             const members = await groupMembers(groupId);
             if (!members.includes(uid)) throw httpError(403, 'Forbidden');
-            members.filter(member => member !== uid)
-              .forEach(member => send(member, { t: 'typing', from: uid, group: groupId }));
+            const recipients = members.filter(member => member !== uid);
+            const key = `${uid}:group:${groupId}`;
+            if (event.typing === false) {
+              stopTyping(key);
+            } else {
+              relayTyping(
+                key,
+                recipients,
+                { t: 'typing', from: uid, group: groupId },
+                { t: 'typing_stop', from: uid, group: groupId }
+              );
+            }
           } else {
             const peerId = requireObjectId(event.to, 'recipient id');
             if (peerId === uid || !await User.exists({ _id: peerId })) throw httpError(404, 'Recipient not found');
-            send(peerId, { t: 'typing', from: uid });
+            const key = `${uid}:direct:${peerId}`;
+            if (event.typing === false) {
+              stopTyping(key);
+            } else {
+              relayTyping(
+                key,
+                [peerId],
+                { t: 'typing', from: uid },
+                { t: 'typing_stop', from: uid }
+              );
+            }
           }
           break;
         }

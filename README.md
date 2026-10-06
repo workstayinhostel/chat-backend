@@ -34,7 +34,7 @@ Set `SUPABASE_URL` and a newly rotated `SUPABASE_SECRET_KEY` in the server envir
 
 Create the `metufy` bucket in Supabase Storage and make it public if clients should receive durable, directly displayable URLs (the completion endpoint returns a public URL). Upload writes use signed upload tokens; do not add an unrestricted anonymous upload policy. Use `uploadConversationImage(file)` for chat images or `uploadProfilePhoto(file)` for profile photos. Objects are stored under `conversations/<user-id>/` and `profiles/<user-id>/` respectively; successful profile photo uploads also update the user's `avatarUrl`. Both helpers return `{ id, fileKey, url, mime, size, folder }`. Compressed images may be any size up to 500,000 bytes; there is no minimum size.
 
-The WebSocket accepts cookie-authenticated `SEND_MESSAGE`, `MARK_READ`, and `WEBRTC_SIGNAL` events and emits `SEND_MESSAGE_ACK`, `MESSAGE`, `MESSAGES_READ`, `PRESENCE`, and `WEBRTC_SIGNAL` events. Existing short-form client events remain supported.
+The WebSocket accepts cookie-authenticated `SEND_MESSAGE`, `MARK_READ`, and `WEBRTC_SIGNAL` events and emits `SEND_MESSAGE_ACK`, `MESSAGE`, `MESSAGES_READ`, `PRESENCE`, and `WEBRTC_SIGNAL` events. Existing short-form client events remain supported. Short-form `typing` events are relayed to chat recipients, and the server emits `typing_stop` 500 ms after the sender's latest typing event; clients should clear the indicator when they receive it. Send `{ "t": "typing", "typing": false, ... }` to stop the indicator immediately.
 
 ## MongoDB data
 
