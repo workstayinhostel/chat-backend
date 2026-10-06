@@ -96,13 +96,17 @@ const signToken = user => jwt.sign(
   JWT_SECRET,
   { algorithm: 'HS256', expiresIn: '30d', issuer: 'chatapp', audience: 'chatapp-api' }
 );
-const setAuthCookie = (res, token) => res.cookie('chat_token', token, {
-  httpOnly: true,
-  secure: true,
-  sameSite: 'none',
-  path: '/',
-  maxAge: 30 * 24 * 60 * 60 * 1000
-});
+const setAuthCookie = (req, res, token) => {
+  const secure = process.env.NODE_ENV === 'production' || req.secure ||
+    req.get('x-forwarded-proto')?.split(',')[0].trim().toLowerCase() === 'https';
+  return res.cookie('chat_token', token, {
+    httpOnly: true,
+    secure,
+    sameSite: secure ? 'none' : 'lax',
+    path: '/',
+    maxAge: 30 * 24 * 60 * 60 * 1000
+  });
+};
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 const requireObjectId = (value, label = 'id') => {
   if (!mongoose.isValidObjectId(value)) throw httpError(400, `Invalid ${label}`);
@@ -340,7 +344,7 @@ app.post('/api/auth/google', authRateLimit, asyncRoute(async (req, res) => {
     });
   }
   const token = signToken(user);
-  setAuthCookie(res, token);
+  setAuthCookie(req, res, token);
   res.json({ token, user: currentUser(user) });
 }));
 
@@ -354,8 +358,8 @@ app.post('/api/auth/setup', auth, asyncRoute(async (req, res) => {
   if (!/^[a-z0-9_]{3,20}$/.test(username)) {
     throw httpError(400, 'Username must be 3-20 letters, numbers, or underscores');
   }
-  if (typeof password !== 'string' || password.length < 12 || password.length > 128) {
-    throw httpError(400, 'Password must be between 12 and 128 characters');
+  if (typeof password !== 'string' || password.length < 3 || password.length > 20) {
+    throw httpError(400, 'Password must be between 3 and 20 characters');
   }
   user.username = username;
   user.displayName = displayName || username;
@@ -375,7 +379,7 @@ app.post('/api/auth/login', authRateLimit, asyncRoute(async (req, res) => {
     throw httpError(401, 'Invalid username or password');
   }
   const token = signToken(user);
-  setAuthCookie(res, token);
+  setAuthCookie(req, res, token);
   res.json({ token, user: currentUser(user) });
 }));
 

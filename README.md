@@ -28,6 +28,8 @@ App sign-in tokens expire after 30 days. The legacy `/api/upload` endpoint store
 
 The API listens on port `4000` by default; its WebSocket endpoint is `/ws`. For mobile testing, connect the phone and development computer to the same Wi-Fi network and open `http://192.168.1.83:8000` on the phone. The Vite dev server binds to all network interfaces, and the client uses the current page's hostname for API/WebSocket connections. Google login expects a Google Identity Services ID token in `{ "credential": "..." }` at `POST /api/auth/google`. Send the returned app JWT as `Authorization: Bearer <token>` for HTTP APIs. The first sign-in creates a MongoDB `users` record; complete profile setup at `POST /api/auth/setup`.
 
+For plain HTTP development, the auth cookie uses `SameSite=Lax` without `Secure` so mobile browsers can authenticate the WebSocket upgrade when the frontend and API share a hostname. In production, run with `NODE_ENV=production` and serve the API and frontend over HTTPS; the cookie uses `Secure` and `SameSite=None`.
+
 ## Supabase image uploads
 
 Set `SUPABASE_URL` and a newly rotated `SUPABASE_SECRET_KEY` in the server environment. The secret key is used only by the server to mint short-lived, user-scoped upload URLs; never put it in frontend configuration. Set `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, and (if the API is on another origin) `VITE_API_URL` in the frontend build environment. Import `uploadImage` from `mediaUtils.js` and call it with the selected `File`. The HTTP-only `chat_token` cookie authenticates the upload-ticket and completion requests. Serve the API and frontend over HTTPS so the `Secure` cookie is sent for WebSocket upgrades.
